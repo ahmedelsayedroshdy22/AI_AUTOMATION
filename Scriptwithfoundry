@@ -1,0 +1,150 @@
+import json
+import os
+import glob
+from azure.identity import ClientSecretCredential
+from azure.ai.projects import AIProjectClient
+from azure.ai.projects.models import PromptAgentDefinition, FileSearchTool, FunctionTool, MCPTool, Tool
+from openai.types.responses.response_input_param import FunctionCallOutput, ResponseInputParam
+
+# --- CONFIGURATION & AUTH ---
+# Recommendation: Use os.getenv("VAR_NAME") for production security
+TENANT_ID = "id to be inserted"
+CLIENT_ID = "id to be provided"
+CLIENT_SECRET = "secret to be provided" # PLEASE ROTATE THIS SECRET
+PROJECT_ENDPOINT = "https://zayedlabai-7377-resource.services.ai.azure.com/api/projects/zayedlabai-7377"
+MODEL_DEPLOYMENT = "gpt-4.1-mini" # Ensure this matches your deployment name
+
+credential = ClientSecretCredential(
+    tenant_id=TENANT_ID,
+    client_id=CLIENT_ID,
+    client_secret=CLIENT_SECRET,
+)
+
+project_client = AIProjectClient(
+    endpoint=PROJECT_ENDPOINT,
+    credential=credential,
+)
+openai_client = project_client.get_openai_client()
+print("✅ Connected to Azure AI Foundry!")
+
+
+# --- TOOL 1: FILE SEARCH (RAG) ---
+vector_store_id = "" # Set this after first run to reuse: "vs_..."
+
+if vector_store_id:
+    vector_store = openai_client.vector_stores.retrieve(vector_store_id)
+    print(f"📂 Using existing vector store: {vector_store.id}")
+else:
+    vector_store = openai_client.vector_stores.create(name="newsaipem")
+    print(f"✨ Created new vector store: {vector_store.id}")
+    for file_path in glob.glob("documents/*.md"):
+        file = openai_client.vector_stores.files.upload_and_poll(
+            vector_store_id=vector_store.id, file=open(file_path, "rb")
+        )
+        print(f"   Uploaded: {file_path}")
+
+
+# --- TOOL 2: LOCAL FUNCTION ---
+def get_pizza_quantity(people: int) -> str:
+    qty = (people // 2) + (people % 2)
+    print(f"   [LOG] Calculating for {people} people -> {qty} pizzas.")
+    return f"For {people} people, you should order {qty} pizzas."
+
+func_tool = FunctionTool(
+    name="get_pizza_quantity",
+    description="Get the quantity of pizza to order based on the number of people.",
+    parameters={
+        "type": "object",
+        "properties": {
+            "people": {"type": "integer", "description": "Number of people"},
+        },
+        "required": ["people"],
+    },
+)
+
+
+# --- TOOL 3: MCP ---
+mcp_tool = MCPTool(
+    server_label="contoso-pizza-mcp",
+    server_url="https://ca-pizza-mcp-sc6u2typoxngc.graypond-9d6dd29c.eastus2.azurecontainerapps.io/sse",
+    require_approval="never"
+)
+
+
+# --- AGENT SETUP ---what
+toolset: list[Tool] = [
+    FileSearchTool(vector_store_ids=[vector_store.id]),
+    func_tool,
+    mcp_tool
+]
+
+agent = project_client.agents.create_version(
+    agent_name="hello-world-agent",
+    definition=PromptAgentDefinition(
+        model=MODEL_DEPLOYMENT,
+        instructions="You are a helpful pizza ordering assistant. Use your tools to answer questions.",
+        tools=toolset,
+    ),
+)
+print(f"🤖 Agent Ready: {agent.name} (v{agent.version})")
+
+conversation = openai_client.conversations.create()
+
+
+# --- CHAT LOOP ---
+while True:
+    user_input = input("\nYou: ")
+    if user_input.lower() in ["exit", "quit"]:
+        break
+
+    # 1. Send user message
+    response = openai_client.responses.create(
+        conversation=conversation.id,
+        input=user_input,
+        extra_body={
+            "agent_reference": {
+                "type": "agent_reference",
+                "name": agent.name
+            }
+        },
+    )
+
+    # 2. Handle Tool Calls (Loops until text response is generated)
+    while response.status in ["requires_action", "incomplete"]:
+        tool_outputs = []
+
+        for item in response.output:
+            if item.type == "function_call":
+                if item.name == "get_pizza_quantity":
+                    args = json.loads(item.arguments)
+                    result = get_pizza_quantity(**args)
+
+                    tool_outputs.append(
+                        FunctionCallOutput(
+                            call_id=item.call_id,
+                            output=json.dumps({"pizza_quantity": result}),
+                        )
+                    )
+
+        if not tool_outputs:
+            break
+
+        # Submit tool results back to agent
+        response = openai_client.responses.create(
+            previous_response_id=response.id,
+            input=tool_outputs,
+            extra_body={
+                "agent_reference": {
+                    "type": "name",
+                    "name": agent.name
+                }
+            },
+        )
+
+    # 3. Display Final Answer
+    if hasattr(response, 'output_text'):
+        print(f"Assistant: {response.output_text}")
+    else:
+        # Fallback if text is inside the output list
+        text_output = next((o.text for o in response.output if o.type == "text"), "No response generated.")
+        print(f"Assistant: {text_output}")
